@@ -2,6 +2,11 @@
 
 #include <chrono>
 #include <iostream>
+#include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#include <errno.h>
+#endif
 
 #include "debuggerinterface.h"
 #include "dsp.h"
@@ -92,7 +97,29 @@ namespace dsp56k
 
 	void DSPThread::threadFunc()
 	{
+		/* On Move hardware: use normal priority + core 3 affinity.
+		 * We run in a forked child process with our own address space,
+		 * so mmap_lock contention with MoveOriginal is not a concern.
+		 * Core 3 affinity isolates L1 cache from Move's RT threads. */
+#ifdef __linux__
+		{
+			errno = 0;
+			if (nice(0) == -1 && errno != 0)
+				fprintf(stderr, "DSP: nice(0) failed errno=%d\n", errno);
+			else
+				fprintf(stderr, "DSP: nice(0) set OK\n");
+
+			cpu_set_t cpuset;
+			CPU_ZERO(&cpuset);
+			CPU_SET(3, &cpuset);
+			if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
+				fprintf(stderr, "DSP: core 3 affinity failed errno=%d\n", errno);
+			else
+				fprintf(stderr, "DSP: pinned to core 3 OK\n");
+		}
+#else
 		ThreadTools::setCurrentThreadPriority(ThreadPriority::Highest);
+#endif
 		ThreadTools::setCurrentThreadName(m_name.empty() ? "DSP" : "DSP " + m_name);
 
 		uint64_t instructions = 0;
@@ -147,6 +174,13 @@ namespace dsp56k
 				counter += 128;
 
 				m_callback(static_cast<uint32_t>(di));
+
+				/* Throttle during boot phase only — JIT compilation does heavy
+				 * mmap/cache-flush. Steady state runs unthrottled since we're
+				 * in a forked child process on a dedicated core (3).
+				 */
+				if (totalInstructions < 5000000)
+					usleep(100);
 
 #if DSP56300_DEBUGGER
 				m_dsp.setDebugger(m_nextDebugger);
