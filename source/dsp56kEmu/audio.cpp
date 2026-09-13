@@ -10,6 +10,21 @@ namespace dsp56k
 		{
 			m_readRxCallback = [this](uint64_t& _frameIndex, RxFrame& _values)
 			{
+				// Skip forward if the host asked us to. This is the CONSUMER side of
+				// the ring, which is the only side that may pop it. See the note on
+				// m_discardInputFrames in audio.h.
+				auto discard = m_discardInputFrames.load(std::memory_order_acquire);
+
+				while(discard)
+				{
+					if(m_audioInputs.empty())
+						break;
+					m_audioInputs.pop_front();
+					--discard;
+				}
+
+				m_discardInputFrames.store(discard, std::memory_order_release);
+
 				m_audioInputs.waitNotEmpty();
 				_values = m_audioInputs.pop_front();
 				++_frameIndex;
