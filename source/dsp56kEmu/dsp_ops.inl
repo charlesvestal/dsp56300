@@ -314,10 +314,7 @@ namespace dsp56k
 		{
 			const auto backupCCR = ccr();
 
-			const auto& cacheEntry = m_opcodeCache[pcCurrentInstruction];
-			const auto& instAlu = cacheEntry.opAlu;
-
-			exec_jump(instAlu, op);
+			exec_jump(m_opcodeCacheParallel[pcCurrentInstruction].opAlu, op);
 
 			ccr(backupCCR);
 		}
@@ -326,10 +323,7 @@ namespace dsp56k
 	{
 		if( checkCondition<Ifcc_U>(op) )
 		{
-			const auto& cacheEntry = m_opcodeCache[pcCurrentInstruction];
-			const auto& instAlu = cacheEntry.opAlu;
-
-			exec_jump(instAlu, op);
+			exec_jump(m_opcodeCacheParallel[pcCurrentInstruction].opAlu, op);
 		}
 	}
 	inline void DSP::op_Illegal(const TWord op)
@@ -429,11 +423,13 @@ namespace dsp56k
 	{
 		errNotImplemented("PFLUSH");		
 	}
-	inline void DSP::op_Pflushun(const TWord op)
+	// not inline: the flat dispatch thunks odr-use this from another TU
+	void DSP::op_Pflushun(const TWord op)
 	{
 		cache.pflushun();
 	}
-	inline void DSP::op_Pfree(const TWord op)
+	// not inline: the flat dispatch thunks odr-use this from another TU
+	void DSP::op_Pfree(const TWord op)
 	{
 		cache.pfree();
 	}
@@ -481,7 +477,8 @@ namespace dsp56k
 		const int loopcount = decode_dddddd_read(getFieldValue<Rep_S,Field_dddddd>(op)).var;
 		rep_exec(loopcount);
 	}
-	inline void DSP::op_Reset(const TWord op)
+	// not inline: the flat dispatch thunks odr-use this from another TU
+	void DSP::op_Reset(const TWord op)
 	{
 		resetSW();
 	}
@@ -547,104 +544,10 @@ namespace dsp56k
 		if(checkCondition<Trapcc>(op))
 			errNotImplemented("TRAPcc");
 	}
-	inline void DSP::op_ResolveCache(const TWord op)
-	{
-		auto& cacheEntry = m_opcodeCache[pcCurrentInstruction];
-		cacheEntry.op = &DSP::op_Nop;
-
-		if( !op )
-		{
-			op_Nop(0);
-			return;
-		}
-
-		if(Opcodes::isNonParallelOpcode(op))
-		{
-			const auto* oi = m_opcodes.findNonParallelOpcodeInfo(op);
-
-			if(!oi)
-			{
-				m_opcodes.findNonParallelOpcodeInfo(op);		// retry here to help debugging
-				assert(0 && "illegal instruction");
-			}
-
-			cacheEntry.op = resolvePermutation(oi->m_instruction, op);
-
-			exec_jump(cacheEntry.op, op);
-			return;
-		}
-		const auto* oiMove = m_opcodes.findParallelMoveOpcodeInfo(op);
-		if(!oiMove)
-		{
-			m_opcodes.findParallelMoveOpcodeInfo(op);		// retry here to help debugging
-			assert(0 && "illegal instruction");
-		}
-
-		const OpcodeInfo* oiAlu = nullptr;
-
-		if(op & 0xff)
-		{
-			oiAlu = m_opcodes.findParallelAluOpcodeInfo(op);
-			if(!oiAlu)
-			{
-				m_opcodes.findParallelAluOpcodeInfo(op);	// retry here to help debugging
-				assert(0 && "invalid instruction");						
-			}
-		}
-
-		switch (oiMove->m_instruction)
-		{
-		case Move_Nop:
-			// Only ALU, no parallel move
-			if(oiAlu)
-			{
-				cacheEntry.op = resolvePermutation(oiAlu->m_instruction, op);
-				exec_jump(cacheEntry.op, op);
-			}
-			else
-			{
-				op_Nop(op);
-			}
-			break;
-		case Ifcc:
-		case Ifcc_U:
-			// IFcc executes the ALU instruction if the condition is met, therefore no ALU exec by us
-			if(oiAlu)
-			{
-				const auto ifccFunc = resolvePermutation(oiMove->m_instruction, op);
-				cacheEntry.op = ifccFunc;
-				cacheEntry.opAlu = resolvePermutation(oiAlu->m_instruction, op);
-				exec_jump(cacheEntry.op, op);
-			}
-			else
-			{
-				op_Nop(op);						
-			}
-			break;
-		default:
-			if(!oiAlu)
-			{
-				// if there is no ALU instruction, do only the move
-				cacheEntry.op = resolvePermutation(oiMove->m_instruction, op);
-				exec_jump(cacheEntry.op, op);
-			}
-			else
-			{
-				// call special function that simulates latch registers for alu op + parallel move
-				cacheEntry.op = &DSP::op_Parallel;
-				cacheEntry.opMove = resolvePermutation(oiMove->m_instruction, op);
-				cacheEntry.opAlu = resolvePermutation(oiAlu->m_instruction, op);
-				op_Parallel(op);
-			}
-		}
-	}
-
 	inline void DSP::op_Parallel(const TWord op)
 	{
-		const auto& cacheEntry = m_opcodeCache[pcCurrentInstruction];
-		const auto& instMove = cacheEntry.opMove;
-		const auto& instAlu = cacheEntry.opAlu;
+		const auto& parallelEntry = m_opcodeCacheParallel[pcCurrentInstruction];
 
-		exec_parallel(instMove, instAlu, op);
+		exec_parallel(parallelEntry.opMove, parallelEntry.opAlu, op);
 	}
 }
