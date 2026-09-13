@@ -20,6 +20,7 @@ namespace dsp56k
 	Memory::Memory(const IMemoryValidator& _memoryMap, TWord _memSize/* = 0xc00000*/, TWord* _externalBuffer/* = nullptr*/)
 		: m_memoryMap(_memoryMap)
 		, m_size({_memSize, _memSize, _memSize})
+		, m_pCodeSize(_memSize)
 		, m_mem({nullptr})
 		, m_bridgedMemoryAddress(_memSize)
 		, m_dsp(nullptr)
@@ -52,6 +53,7 @@ namespace dsp56k
 	Memory::Memory(const IMemoryValidator& _memoryMap, TWord _memSizeP, TWord _memSizeXY, TWord _brigedMemoryAddress/* = 0*/, TWord* _externalBuffer/* = nullptr*/)
 		: m_memoryMap(_memoryMap)
 		, m_size({_memSizeP, _memSizeXY, _memSizeXY})
+		, m_pCodeSize(_memSizeP)
 		, m_mem({nullptr})
 		, m_bridgedMemoryAddress(_brigedMemoryAddress)
 		, m_dsp(nullptr)
@@ -71,6 +73,17 @@ namespace dsp56k
 		else
 		{
 			m_mmuBuffer.reset();
+
+			// Without the MMU aliasing, every X/Y access above the bridge is TRANSLATED
+			// into P (memTranslateAddress), so P is the region that physically spans the
+			// bridged range -- calcPMemSize, which is what the layout below allocates.
+			// m_size still held the raw _memSizeP, so the bounds check in get() rejected
+			// every one of those accesses and returned 0. The microQ and the XT render
+			// silence as a result; the Virus survives because it barely uses the range.
+			// Only the non-MMU path translates, so only it was ever affected -- i.e. iOS,
+			// where shm_open is refused inside the sandbox and this path is forced.
+			m_size[MemArea_P] = pSize;
+
 			auto* address = _externalBuffer;
 
 			if(!address)

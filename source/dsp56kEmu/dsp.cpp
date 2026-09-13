@@ -1315,11 +1315,11 @@ namespace dsp56k
 	void DSP::clearOpcodeCache()
 	{
 		m_opcodeCache.clear();
-		m_opcodeCache.resize(mem.sizeP(), {nullptr, 0, 0});
+		m_opcodeCache.resize(mem.sizePCode(), {nullptr, 0, 0});
 		m_opcodeCacheParallel.clear();
-		m_opcodeCacheParallel.resize(mem.sizeP(), {nullptr, nullptr});
+		m_opcodeCacheParallel.resize(mem.sizePCode(), {nullptr, nullptr});
 		if constexpr(!g_useJIT)
-			m_opcodeCycleCache.assign(mem.sizeP(), 0);
+			m_opcodeCycleCache.assign(mem.sizePCode(), 0);
 	}
 
 	void DSP::clearOpcodeCache(const TWord _address)
