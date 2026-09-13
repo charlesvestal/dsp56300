@@ -384,12 +384,16 @@ namespace dsp56k
 
 		getRegisters(m_writtenRegs, m_readRegs, _instMove, _op);
 
+		// the MOVE's own footprint, before the ALU's is merged in: it decides which
+		// accumulators actually need the write latch (see JitDspRegPool::aluNeedsWriteReg)
+		const auto moveRegs = m_writtenRegs | m_readRegs;
+
 		RegisterMask written, read;
 		getRegisters(written, read, _instAlu, _op);
 		add(m_writtenRegs, written);
 		add(m_readRegs, read);
 
-		m_block.dspRegPool().setIsParallelOp(true);
+		m_block.dspRegPool().setIsParallelOp(true, moveRegs);
 
 		emitOpProlog();
 	
@@ -428,30 +432,65 @@ namespace dsp56k
 		// triaged from a log without a debugger attached.
 		fprintf(stderr, "*** JIT errNotImplemented: opcode=$%06X\n", op);
 		fflush(stderr);
+
+		// The block advances by m_opSize, which stays 1 unless the implementation fetches the
+		// extension word. For an unimplemented two word instruction that leaves the immediate to be
+		// compiled as the next instruction, so skip the real length instead.
+		m_opSize = m_opcodes.getOpcodeLength(op);
 		assert(0 && "instruction not implemented");
+	}
+
+	/*	Open a loop. Shared by DO and DO FOREVER, which differ in exactly two ways: FOREVER does not
+		load the loop counter, because it never counts, and it raises SR_FV alongside SR_LF so that
+		the loop end knows never to terminate on the counter. A null _lc means forever.
+	*/
+	void JitOps::do_start(const DspValue* _lc, const TWord _addr)
+	{
+		{
+			DspValue la(m_block), lc(m_block);
+			m_dspRegs.getLA(la);
+			m_dspRegs.getLC(lc);
+			setSSHSSL(la, lc);
+		}
+
+		m_asm.mov(m_dspRegs.getLA(JitDspRegs::Write), asmjit::Imm(_addr));
+
+		if(_lc)
+		{
+			if(_lc->isImmediate())
+				m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), asmjit::Imm(_lc->imm24()));
+			else
+				m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), _lc->get());
+		}
+
+		pushPCSR();
+
+		/*	SR_FV describes the loop that is starting, not the one it is nested in. A counted DO
+			inside a DO FOREVER has to clear it, or the loop end would never terminate the inner
+			loop either. A forever loop is about to set it regardless, so it has nothing to clear.
+			Either way the outer loop gets its flag back from the stack in do_end.
+		*/
+		if(_lc)
+		{
+			m_asm.and_(m_dspRegs.getSR(JitDspRegs::ReadWrite), asmjit::Imm(~SR_FV));
+			m_asm.or_(m_dspRegs.getSR(JitDspRegs::ReadWrite), asmjit::Imm(SR_LF));
+		}
+		else
+		{
+			m_asm.or_(m_dspRegs.getSR(JitDspRegs::ReadWrite), asmjit::Imm(SR_LF | SR_FV));
+		}
+	}
+
+	void JitOps::do_execForever(const TWord _addr)
+	{
+		do_start(nullptr, _addr);
 	}
 
 	void JitOps::do_exec(const DspValue& _lc, TWord _addr)
 	{
 		auto startLoop = [&]()
 		{
-			{
-				DspValue la(m_block), lc(m_block);
-				m_dspRegs.getLA(la);
-				m_dspRegs.getLC(lc);
-				setSSHSSL(la, lc);
-			}
-
-			m_asm.mov(m_dspRegs.getLA(JitDspRegs::Write), asmjit::Imm(_addr));
-
-			if(_lc.isImmediate())
-				m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), asmjit::Imm(_lc.imm24()));
-			else
-				m_asm.mov(r32(m_dspRegs.getLC(JitDspRegs::Write)), _lc.get());
-
-			pushPCSR();
-
-			m_asm.or_(m_dspRegs.getSR(JitDspRegs::ReadWrite), asmjit::Imm(SR_LF));
+			do_start(&_lc, _addr);
 		};
 
 		if(_lc.isImmediate())
@@ -479,13 +518,79 @@ namespace dsp56k
 		const RegGP r(m_block);
 		do_end(r);
 	}
+
+	/*	A DO loop whose last instruction is a call. Hardware retires the loop at instruction
+		FETCH, so by the time the call pushes its return address the next PC is already decided:
+		the loop start while iterations remain, the instruction after the loop on the last one.
+		Emitting that decision BEFORE the branch reproduces the hardware ordering exactly, and
+		avoids having to reach underneath the call's own stack frame afterwards.
+	*/
+	void JitOps::emitLoopEndBeforeBranch(const bool _loopStartIsBlockStart, const bool _loopIsForever, const TWord _blockPc, const TWord _pcAfterBranch)
+	{
+		const auto lastIteration = m_asm.newLabel();
+		const auto done = m_asm.newLabel();
+
+		auto& pool = m_block.dspRegPool();
+
+		// As in jumpIfLoop: nothing may be allocated inside the branches. A spill emitted on one
+		// path only leaves the register pool describing a state the other path never reaches.
+		const RegGP temp(m_block);
+
+		const auto sr = r32(pool.get(PoolReg::DspSR, true, true));
+		                r32(pool.get(PoolReg::DspLA, true, true));	// unused here, but do_end needs it
+		const auto lc = r32(pool.get(PoolReg::DspLC, true, true));
+
+		pool.lock(PoolReg::DspSR);
+		pool.lock(PoolReg::DspLA);
+		pool.lock(PoolReg::DspLC);
+
+		DSPReg pc(m_block, PoolReg::DspPC, true, true);
+
+		m_asm.mov(r32(pc), asmjit::Imm(_pcAfterBranch));	// default: leave the loop
+
+		m_asm.bitTest(sr, SRB_LF);
+		m_asm.jz(done);										// not inside a loop at all
+
+		// a DO FOREVER has no loop counter and cannot retire here - it only ends via ENDDO or BRKcc
+		if(!_loopIsForever)
+		{
+			m_asm.cmp(lc, asmjit::Imm(1));
+			m_asm.jle(lastIteration);
+			m_asm.dec(lc);
+		}
+
+		if(_loopStartIsBlockStart)
+		{
+			m_asm.mov(r32(pc), asmjit::Imm(_blockPc));
+		}
+		else
+		{
+			const auto ss = r64(pc);
+			m_dspRegs.getSS(ss);							// note: not getSSH, that would move SP
+			m_asm.shr(ss, asmjit::Imm(24));
+		}
+		m_asm.jmp(done);
+
+		m_asm.bind(lastIteration);
+		if(!_loopIsForever)
+			do_end(temp);									// pops LA/LC, restores LF
+
+		m_asm.bind(done);
+
+		pool.unlock(PoolReg::DspSR);
+		pool.unlock(PoolReg::DspLA);
+		pool.unlock(PoolReg::DspLC);
+	}
+
 	void JitOps::do_end(const RegGP& r)
 	{
-		// restore previous loop flag
+		// restore the previous loop flags, both of them - a DO FOREVER raised SR_FV as well
 		{
+			constexpr auto loopFlags = SR_LF | SR_FV;
+
 			m_dspRegs.getSS(r64(r.get()));
-			m_asm.and_(r32(r), asmjit::Imm(SR_LF));
-			m_asm.and_(r32(m_dspRegs.getSR(JitDspRegs::ReadWrite)), asmjit::Imm(~SR_LF));
+			m_asm.and_(r32(r), asmjit::Imm(loopFlags));
+			m_asm.and_(r32(m_dspRegs.getSR(JitDspRegs::ReadWrite)), asmjit::Imm(~loopFlags));
 			m_asm.or_(r32(m_dspRegs.getSR(JitDspRegs::ReadWrite)), r32(r.get()));
 		}
 
@@ -627,9 +732,41 @@ namespace dsp56k
 		do_exec( lc, m_pcCurrentOp + displacement);
 	}
 
+	void JitOps::op_DoForever(TWord op)
+	{
+		do_execForever(absAddressExt<DoForever>());
+	}
+
+	void JitOps::op_DorForever(TWord op)
+	{
+		const auto displacement = pcRelativeAddressExt<DorForever>();
+		do_execForever(m_pcCurrentOp + displacement);
+	}
+
 	void JitOps::op_Enddo(TWord op)
 	{
 		do_end();
+	}
+
+	void JitOps::op_BRKcc(TWord op)
+	{
+		// Exit the current DO loop early:
+		//   LA + 1 -> PC; SSL(LF,FV) -> SR; SP-1 -> SP; SSH -> LA; SSL -> LC; SP-1 -> SP
+		checkCondition<BRKcc>(op, [&]()
+		{
+			// LA has to be read here, before do_end() restores it from the stack
+			{
+				DspValue la(m_block);
+				m_dspRegs.getLA(la);
+
+				DspValue pc(m_block, PoolReg::DspPC, false, true);
+				m_asm.mov(r32(pc), r32(la));
+				m_asm.add(r32(pc), asmjit::Imm(1));
+			}
+
+			// do_end() restores LF and FV together here, which is what BRKcc wants
+			do_end();
+		}, true);
 	}
 
 	template<bool BackupCCR> void JitOps::op_Ifcc(const TWord op)
@@ -774,6 +911,17 @@ namespace dsp56k
 		m_dspRegs.setPC(_absAddr);
 	}
 
+#ifndef NDEBUG
+	void callDSPFastInterruptViolation(DSP*, const TWord _pc)
+	{
+		LOG("A JSR at " << HEX(_pc) << " below Vba_End escalated to a long interrupt outside interrupt "
+			"servicing. The device has dynamicFastInterrupts disabled, which declares that no ordinary "
+			"code lives in the vector region - this JSR breaks that promise. LF, SA and the scaling bits "
+			"are being cleared with no RTI to restore them, and the damage will surface far from here.");
+		assert(false && "ordinary code in the vector region with dynamicFastInterrupts disabled");
+	}
+#endif
+
 	void JitOps::jsr(const DspValue& _absAddr)
 	{
 		pushPCSR();
@@ -795,12 +943,36 @@ namespace dsp56k
 				m_asm.jnz(skip);
 			}
 
+#ifndef NDEBUG
+			// Static mode reaches here on the address alone, because the device has declared that no
+			// ordinary code lives below Vba_End. That declaration is what makes skipping the runtime
+			// check safe, so it is worth catching a device that breaks it: hardware only performs this
+			// escalation for a JSR the interrupt controller inserted, never for ordinary code that
+			// merely lives at a vector address (measured on the reference simulator with VBA relocated
+			// so the vectors sit at an addressable location). Debug builds only - in release this stays
+			// exactly as costly as it was, which is the whole point of the Static path.
+			else if(m_fastInterruptMode == FastInterruptMode::Static)
+			{
+				const SkipLabel ok(m_asm);
+				{
+					const RegGP processingMode(m_block);
+					getDspProcessingMode(r64(processingMode));
+					m_asm.cmp(processingMode, DSP::ProcessingMode::FastInterrupt);
+					m_asm.jz(ok);
+				}
+				callDSPFunc(&callDSPFastInterruptViolation, m_pcCurrentOp);
+			}
+#endif
+
+			// the interrupt control cycle clears the loop flags too, FV as well as LF. On arm64 the
+			// masks stay split one bit at a time, the same reason the others already are
 #ifdef HAVE_ARM64
 			m_asm.and_(sr, asmjit::Imm(~(SR_S1 | SR_S0)));
 			m_asm.and_(sr, asmjit::Imm(~(SR_SA)));
 			m_asm.and_(sr, asmjit::Imm(~(SR_LF)));
+			m_asm.and_(sr, asmjit::Imm(~(SR_FV)));
 #else
-			m_asm.and_(sr, asmjit::Imm(~(SR_S1 | SR_S0 | SR_SA | SR_LF)));
+			m_asm.and_(sr, asmjit::Imm(~(SR_S1 | SR_S0 | SR_SA | SR_LF | SR_FV)));
 #endif
 			setDspProcessingMode(DSP::LongInterrupt);
 		}
@@ -1042,8 +1214,8 @@ namespace dsp56k
 		// restore previous LC
 		m_asm.movd(r32(m_dspRegs.getLC(JitDspRegs::Write)), lcBackup);
 
-		// op size is the sum of the rep plus the child op
-		assert(m_opSize == 1 && "repeated instruction needs to be a single word instruction");
+		// op size is the sum of the rep plus the child op. The manual only allows a single-word child, but sim56300
+		// repeats a two-word one with its one extension word and continues behind both words, which this does too.
 		m_opSize += opSize;
 	}
 
@@ -1051,6 +1223,20 @@ namespace dsp56k
 	{
 		const auto loopcount = getFieldValue<Rep_xxx,Field_hhhh, Field_iiiiiiii>(op);
 		rep_exec(loopcount);
+	}
+
+	void JitOps::op_Rep_ea(TWord op)
+	{
+		DspValue lc(m_block);
+		readMem<Rep_ea>(lc, op);
+		rep_exec(lc);
+	}
+
+	void JitOps::op_Rep_aa(TWord op)
+	{
+		DspValue lc(m_block);
+		readMem<Rep_aa>(lc, op);
+		rep_exec(lc);
 	}
 
 	void JitOps::op_Rep_S(TWord op)
@@ -1069,6 +1255,17 @@ namespace dsp56k
 	bool JitOps::isPeriphAddress(const TWord _addr) const
 	{
 		return _addr >= getPeriphStartAddr();
+	}
+
+	bool JitOps::isExternalBusAddress(const TWord _addr) const
+	{
+		const auto& config = m_block.getConfig();
+		return _addr >= config.externalBusBegin && _addr < config.externalBusEnd;
+	}
+
+	bool JitOps::isCppHandledAddress(const TWord _addr) const
+	{
+		return isPeriphAddress(_addr) || isExternalBusAddress(_addr);
 	}
 
 	TWord JitOps::getPeriphStartAddr() const

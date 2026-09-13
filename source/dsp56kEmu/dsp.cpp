@@ -4,6 +4,7 @@
 
 #include <iomanip>
 #include <cstring>
+#include <cstdio>
 
 #include "registers.h"
 #include "types.h"
@@ -248,7 +249,8 @@ namespace dsp56k
 				// 4.The Sixteen-bit Arithmetic (SA) mode bit is cleared.
 				// 5.The IPL is raised to disallow further interrupts of the same or lower levels.
 
-				sr_clear(static_cast<CCRMask>(SR_S1 | SR_S0 | SR_SA | SR_LF));
+				// the interrupt control cycle clears the loop flags too, FV as well as LF
+				sr_clear(static_cast<CCRMask>(SR_S1 | SR_S0 | SR_SA | SR_LF | SR_FV));
 
 				m_processingMode = LongInterrupt;
 				m_interruptFunc = &dspExecNop;
@@ -424,12 +426,13 @@ namespace dsp56k
 
 		auto& dsp = const_cast<DSP&>(*this);
 
+		const auto dirty = ccrCache.dirty;
 		dsp.ccrCache.dirty = 0;
-		
-//		dsp.sr_s_update();
-		dsp.sr_e_update(ccrCache.alu);
-		dsp.sr_u_update(ccrCache.alu);
-		dsp.sr_n_update(ccrCache.alu);
+
+//		if(dirty & CCR_S)	dsp.sr_s_update();
+		if(dirty & CCR_E)	dsp.sr_e_update(ccrCache.alu);
+		if(dirty & CCR_U)	dsp.sr_u_update(ccrCache.alu);
+		if(dirty & CCR_N)	dsp.sr_n_update(ccrCache.alu);
 	}
 
 	void DSP::sr_debug(char* _dst) const
@@ -539,8 +542,12 @@ namespace dsp56k
 	//
 	bool DSP::do_end()
 	{
-		// restore previous loop flag
+		// Restore the previous loop flags - BOTH of them. The manual's ENDDO operation line says
+		// SSL(LF) only, but the hardware restores the DO FOREVER flag as well: measured on the
+		// reference simulator, a stacked $018000 sets both and a stacked $000000 clears both, so it
+		// copies the two bits rather than or-ing them in. The JIT's do_end() always did this.
 		sr_toggle( SR_LF, (ssl().var & SR_LF) != 0 );
+		sr_toggle( SR_FV, (ssl().var & SR_FV) != 0 );
 
 		// decrement SP twice, restoring old loop settings
 		decSP();
@@ -571,6 +578,12 @@ namespace dsp56k
 		--reg.lc.var;
 		execOp(repeatedOpPC);
 
+		// A two-word instruction moves PC past its extension word every time it runs, but it is fetched only
+		// once. sim56300 continues behind the first pass, however often it repeats.
+		const auto pcNext = reg.pc;
+
+		// repeatedOpPC is pcCurrentInstruction captured before execOp(); the cache is
+		// keyed on the PC, so index it with the PC we actually executed.
 		const auto& opCache = m_opcodeCache[repeatedOpPC];
 
 		const auto func = opCache.op;
@@ -586,6 +599,7 @@ namespace dsp56k
 //			traceOp();
 		}
 
+		reg.pc = pcNext;
 		reg.lc = lcBackup;
 
 		return true;
@@ -1152,16 +1166,20 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		TInt64 d64 = aluSignextend(d);
+		const TInt64 d64 = aluSignextend(d);
 
-		d64 = d64 < 0 ? -d64 : d64;
+		// Negate unsigned: the minimum has no positive counterpart and negating it as a signed value is UB. It stays
+		// the minimum, which is also ABS's only overflow: sim56300 gives sr=$00037a for a=$80000000000000.
+		const auto magnitude = d64 < 0 ? static_cast<uint64_t>(0) - static_cast<uint64_t>(d64) : static_cast<uint64_t>(d64);
 
-		d.var = d64;
+		d.var = static_cast<TReg56::MyType>(magnitude);
 		aluMask(d);
 
+		constexpr auto minimum = static_cast<uint64_t>(1) << (55 + g_aluShift);
+
 		sr_z_update(d);
-	//	sr_v_update(d);
-	//	sr_l_update_by_v();
+		sr_toggle(CCR_V, static_cast<uint64_t>(d.var) == minimum);
+		sr_l_update_by_v();
 		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
 	}
 
@@ -1184,14 +1202,18 @@ namespace dsp56k
 	{
 		TReg56& d = ab ? reg.b : reg.a;
 
-		auto d64 = aluSignextend(d);
-		d64 = -d64;
-		
-		d.var = d64;
+		// The 56 bit minimum negates to itself, which is the only overflow NEG has; sim56300 gives
+		// sr=$00037a for a=$80000000000000 (V and the sticky L set) and leaves both clear for every
+		// other input. Unsigned arithmetic also defines that wraparound - negating the left-aligned
+		// minimum as a signed 64 bit value is UB, which is what this did.
+		constexpr auto minimum = static_cast<uint64_t>(1) << (55 + g_aluShift);
+		const auto value = static_cast<uint64_t>(d.var);
+
+		d.var = static_cast<TReg56::MyType>(static_cast<uint64_t>(0) - value);
 		aluMask(d);
 
 		sr_z_update(d);
-	//	TODO: how to update v? test in sim		sr_v_update(d);
+		sr_toggle(CCR_V, value == minimum);
 		sr_l_update_by_v();
 		setCCRDirty(ab, d, CCR_S | CCR_E | CCR_U | CCR_N);
 	}
@@ -1497,6 +1519,19 @@ aar0=$000008 aar1=$000000 aar2=$000000 aar3=$000000
 
 		const auto str(ss.str());
 		LOG(str);
+
+		// LOG goes to the debugger on Windows, and the assert below is compiled out of release
+		// builds, which would leave an unimplemented instruction silently doing nothing at all.
+		// Say so on stderr regardless of build type, as the JIT side already does.
+		fprintf(stderr, "*** DSP errNotImplemented: %s at PC $%06X\n", _opName, pcCurrentInstruction);
+		fflush(stderr);
+
+		// A two word instruction leaves its extension word unconsumed: the dispatcher advanced PC by
+		// one and only the missing implementation would have fetched the second word. Without this
+		// the PC lands ON the immediate and executes it as an instruction - one observed case decoded
+		// as a MOVEP into a peripheral - so skipping the whole instruction is the least wrong thing
+		// we can do in a release build, where the assert below is gone.
+		setPC(pcCurrentInstruction + m_opcodes.getOpcodeLength(memRead(MemArea_P, pcCurrentInstruction)));
 
 		assert(false && "instruction not implemented, see console for details");
 	}

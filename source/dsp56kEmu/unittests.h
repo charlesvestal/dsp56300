@@ -38,6 +38,15 @@ namespace  dsp56k
 
 		Assembler assembler;
 
+		// Scratch peripheral address for the tests that exercise pp addressing. It has to be inside
+		// the pp range ($ffffc0-$ffffff) AND not be a register any peripheral models, so that a
+		// written value reads back unchanged. The tests used $ffffd0 until the DSP56362 DAX took
+		// that address and broke them, so it is named here rather than spelled out per test.
+		static constexpr TWord g_testPeriphAddr = 0xfffffe;
+
+		// the same address as assembler operand text, so it is only written down in one place
+		static std::string testPeriphAddrStr();
+
 		void runAllTests();
 
 		void conditionCodes();
@@ -76,17 +85,27 @@ namespace  dsp56k
 		void clr();
 		void cmp();
 		void cmpm();
+		void cmpu();
+		void mpyri();
+		void merge();
+		void enddo();
+		void bitmodOnSR();
+		void unimplementedOpcodeLength();
 		void dec();
 		void div();
+		void ccrGroundTruth();
 
 		void dmac();
 		void dmacMultiPrecision();
 		void eor();
+		void extract();
 		void extractu();
 		void extractu_co();
 		void ifcc();
 		void inc();
 		void insert();
+		void saBitfield();
+		void timerPrescaler();
 		void jscc();
 		void lra();
 		void lsl();
@@ -114,6 +133,8 @@ namespace  dsp56k
 		void tcc();
 
 		void move();
+		void sixteenBitArithmeticMoves();
+		void mergeSixteenBit();
 		void movel();
 		void parallel();
 
@@ -127,6 +148,8 @@ namespace  dsp56k
 		void maci_xxxx();
 		void mpy_su();
 		void macsu_unsigned();
+		void mpyMacSignedUnsigned();
+		void macr_rounded();
 		void rnd_scalingModes();
 		void limit_transfer_test();
 		void max_ccr();
@@ -157,6 +180,7 @@ namespace  dsp56k
 
 		// newly implemented
 		void eor_xx();
+		void norm();
 		void ror_();
 
 		// bit-test jump/branch — peripheral addressing modes
@@ -167,9 +191,30 @@ namespace  dsp56k
 		// multi-instruction tests
 		void multiInstructionTests();
 		void rep_multi();
+		void cmpu_multi();
+		void brkcc_multi();
+		void bitmodOnSR_deferredCCR();
 		void rep_div_powerOfTwo();
 		void do_multi();
+		void do_forever();
+		void verifyLoopRetired(uint32_t _expectedR0) const;
+		void enableBranchAtLoopEnd();
+		void do_twoWordCallAtLoopEnd();
+		void enableDynamicFastInterrupts(bool _enable);
+		void callAtVectorAddress();
+		void callAfterRepAtVectorAddress();
+		void repAtVolatileAddress();
+		void repTwoWordInstruction();
+		void adcSbcCarryChain();
+		void conditionalCallAtVectorAddress();
+		void callInsideLoopAtVectorAddress();
+		void do_callAtLoopEnd();
+		void do_callNotAtLoopEnd();
 		void jsr_rts();
+		void ccrBackendParity();
+		void bitTestMemoryEaUpdate();
+		void subr_leftAligned();
+		void ccrCrossBlockConsumer();
 
 		Peripherals56362 peripheralsX;
 		Peripherals56367 peripheralsY;

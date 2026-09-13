@@ -32,6 +32,15 @@ namespace dsp56k
 		void setSamplerate(uint32_t _samplerate);
 		void setCyclesPerSample(uint32_t _cyclesPerSample);
 		void setExternalClockFrequency(uint32_t _freq);
+		void setEnabled(const bool _enabled)
+		{
+			if(m_enabled == _enabled)
+				return;
+			m_enabled = _enabled;
+			if(m_enabled && m_dspInstructionCounter)
+				restartClock();
+		}
+		bool isEnabled() const { return m_enabled; }
 
 		void setEsaiDivider(Esxi* _esai, TWord _divider)
 		{
@@ -46,6 +55,9 @@ namespace dsp56k
 
 		bool setSpeedPercent(uint32_t _percent = 100);
 
+		auto getClockSource() const			{ return m_clockSource; }
+		auto getCyclesPerSample() const		{ return m_cyclesPerSample; }
+		auto getExternalClockFrequency() const { return m_externalClockFrequency; }
 		auto getSpeedInHz() const			{ return m_speedHz; }
 		auto getSpeedPercent() const		{ return m_speedPercent; }
 
@@ -59,7 +71,6 @@ namespace dsp56k
 	protected:
 		auto getDspInstructionCounter() const { return *m_dspInstructionCounter; }
 		auto getLastClock() const { return m_lastClock; }
-		auto getCyclesPerSample() const { return m_cyclesPerSample; }
 		const auto& getEsais() const { return m_esais; }
 		const auto& getPeripherals() const { return m_periph; }
 
@@ -83,6 +94,7 @@ namespace dsp56k
 
 		uint64_t m_speedHz = 0;							// DSP clock speed in Hertz
 		uint32_t m_speedPercent = 100;					// 100% = regular operation, overclock/underclock otherwise
+		bool m_enabled = true;
 
 		struct Clock
 		{

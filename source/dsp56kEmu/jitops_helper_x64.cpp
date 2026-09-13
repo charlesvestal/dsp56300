@@ -273,6 +273,61 @@ namespace dsp56k
 			m_asm.and_(r32(_dst), asmjit::Imm(0x00ffffff));
 		}
 	}
+	void JitOps::transferSaturation16(const JitReg64& _dst, const JitReg64& _src)
+	{
+		// Sixteen-bit Arithmetic mode (FM 3.5.1.2): scaling, limiting to 16 bits, the limited word on bus
+		// bits 15..0 with its sign extension on bits 23..16
+		const auto* mode = m_block.getMode();
+
+		if(_dst != _src)
+			m_asm.mov(r64(_dst), r64(_src));
+
+		if(mode)
+		{
+			int shift = 32 + g_aluBitOffset;
+			if(mode->testSR(SRB_S1))
+				--shift;
+			if(mode->testSR(SRB_S0))
+				++shift;
+			m_asm.sar(_dst, asmjit::Imm(shift));
+		}
+		else
+		{
+			const ShiftReg s0s1(m_block);
+
+			sr_getBitValue(s0s1, SRB_S1);
+			m_asm.shl(_dst, s0s1.get().r8());
+
+			sr_getBitValue(s0s1, SRB_S0);
+			m_asm.sar(_dst, s0s1.get().r8());
+
+			m_asm.sar(_dst, asmjit::Imm(32 + g_aluBitOffset));
+		}
+
+		{
+			const RegGP tester(m_block);
+			m_asm.mov(r32(tester), r32(_dst));
+
+			{
+				const RegScratch minmax(m_block);
+
+				// lower limit
+				m_asm.mov(r32(minmax), 0xffff8000);
+				m_asm.cmp(r32(tester), r32(minmax));
+				m_asm.cmovl(r32(_dst), r32(minmax));
+
+				// upper limit
+				m_asm.not_(r32(minmax)); // = 0x00007fff
+				m_asm.cmp(r32(tester), r32(minmax));
+				m_asm.cmovg(r32(_dst), r32(minmax));
+			}
+
+			m_asm.cmp(r32(tester), r32(_dst));
+			ccr_update_ifNotZero(CCRB_L);
+			m_asm.and_(r32(_dst), asmjit::Imm(0x00ffffff));
+		}
+	}
+
 	void JitOps::transferSaturation48(const JitReg64& _dst, const JitReg64& _src)
 	{
 		// scaling
@@ -286,6 +341,19 @@ namespace dsp56k
 
 		const auto* mode = m_block.getMode();
 
+		// Bring the value down to a sign-extended 56 bit integer BEFORE scaling. Scaling the left-aligned register
+		// first made Scale Up push bit 55 out of the host word, so a value whose bits 55 and 54 differ was limited
+		// with the wrong sign.
+		if(_dst != _src)
+			m_asm.mov(r64(_dst), r64(_src));
+
+		// left-aligned: an arithmetic shift down by 8 yields exactly the sign-extended 56-bit value that
+		// signextend56to64() produces for the right-aligned form, so the limiting below is unchanged
+		if constexpr (g_leftAlignedAlu)
+			m_asm.sar(_dst, asmjit::Imm(8));
+		else
+			signextend56to64(_dst);
+
 		if(mode)
 		{
 			int shift = 0;
@@ -295,26 +363,12 @@ namespace dsp56k
 				--shift;
 
 			if(shift > 0)
-			{
-				if(_dst != _src)
-					m_asm.lea(_dst, ptr(_src, _src));
-				else
-					m_asm.add(_dst, _src);
-			}
-			else
-			{
-				if(_dst != _src)
-					m_asm.mov(r64(_dst), r64(_src));
-
-				if(shift < 0)
-					m_asm.sar(_dst, asmjit::Imm(1));
-			}
+				m_asm.add(_dst, _dst);
+			else if(shift < 0)
+				m_asm.sar(_dst, asmjit::Imm(1));
 		}
 		else
 		{
-			if(_dst != _src)
-				m_asm.mov(r64(_dst), r64(_src));
-
 			const ShiftReg s0s1(m_block);
 
 			sr_getBitValue(s0s1, SRB_S1);
@@ -325,13 +379,6 @@ namespace dsp56k
 		}
 
 		{
-			// left-aligned: an arithmetic shift down by 8 yields exactly the sign-extended 56-bit value that
-			// signextend56to64() produces for the right-aligned form, so the limiting below is unchanged
-			if constexpr (g_leftAlignedAlu)
-				m_asm.sar(_dst, asmjit::Imm(8));
-			else
-				signextend56to64(_dst);
-
 			const RegGP tester(m_block);
 			m_asm.mov(r64(tester), r64(_dst));
 

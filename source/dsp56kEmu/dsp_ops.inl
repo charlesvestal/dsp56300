@@ -123,7 +123,16 @@ namespace dsp56k
 
 	inline void DSP::op_BRKcc(const TWord op)
 	{
-		errNotImplemented("BRKcc");
+		if( !checkCondition<BRKcc>(op) )
+			return;
+
+		// Exit the current DO loop early. The manual gives this as
+		//   LA + 1 -> PC; SSL(LF,FV) -> SR; SP-1 -> SP; SSH -> LA; SSL -> LC; SP-1 -> SP
+		// PC has to be taken from the CURRENT LA, before do_end() restores LA from the stack.
+		setPC(reg.la.var + 1);
+
+		// LF and FV both come back off the stack in do_end(), which is what BRKcc wants too
+		do_end();
 	}
 
 	inline void DSP::op_Bset_ea(const TWord op)
@@ -244,13 +253,13 @@ namespace dsp56k
 	inline void DSP::op_Do_ea(const TWord op)
 	{
 		const auto addr = absAddressExt<Do_ea>();
-		const auto loopCount = effectiveAddress<Do_ea>(op);
+		const auto loopCount = readMem<Do_ea>(op);
 		do_exec(loopCount, addr);
 	}
 	inline void DSP::op_Do_aa(const TWord op)
 	{
 		const auto addr = absAddressExt<Do_aa>();
-		const auto loopCount = effectiveAddress<Do_aa>(op);
+		const auto loopCount = readMem<Do_aa>(op);
 		do_exec(loopCount, addr);
 	}
 	inline void DSP::op_Do_xxx(const TWord op)
@@ -396,7 +405,33 @@ namespace dsp56k
 	}
 	inline void DSP::op_Norm(const TWord op)
 	{
-		errNotImplemented("NORM");
+		const auto rrr = getFieldValue<Norm, Field_RRR>(op);
+		const auto D = getFieldValue<Norm, Field_d>(op);
+
+		// NORM uses the condition codes produced by the preceding accumulator
+		// operation.  Materialize the lazy CCR cache before deciding which of
+		// the three paths to take.
+		const bool extension = sr_test(CCR_E);
+		const bool unnormalized = sr_test_noCache(CCR_U);
+		const bool zero = sr_test_noCache(CCR_Z);
+
+		// NORM leaves the carry bit unchanged (FM 13-146), the shift helpers write it. Rn is 16 bits wide
+		// in Sixteen-bit Compatibility mode.
+		const bool carry = sr_test_noCache(CCR_C) != 0;
+		const int addrMask = sr_test_noCache(SR_SC) ? 0xffff : TReg24::bitMask;
+
+		if(extension)
+		{
+			alu_asr(D, D, 1);
+			reg.r[rrr].var = (reg.r[rrr].var + 1) & addrMask;
+			sr_toggle(CCR_C, carry);
+		}
+		else if(unnormalized && !zero)
+		{
+			alu_asl(D, D, 1);
+			reg.r[rrr].var = (reg.r[rrr].var - 1) & addrMask;
+			sr_toggle(CCR_C, carry);
+		}
 	}
 	inline void DSP::op_Normf(const TWord op)
 	{
@@ -405,6 +440,10 @@ namespace dsp56k
 		const auto D = getFieldValue<Normf, Field_D>(op);
 
 		const TWord s = decode_sss_read<TWord>(sss);
+
+		// NORMF leaves C unchanged (FM 13-147, and the simulator keeps a set C set) but the ASR/ASL
+		// helpers below compute it, so put it back afterwards.
+		const auto carry = sr_test(CCR_C);
 
 		if(!bittest(s, 23))
 		{
@@ -417,6 +456,8 @@ namespace dsp56k
 			const auto negS = static_cast<int>((-signextend<int,24>(s)) & 0xffffff);
 			alu_asl(D, D, negS);
 		}
+
+		sr_toggle(CCR_C, carry != 0);
 	}
 
 	inline void DSP::op_Pflush(const TWord op)

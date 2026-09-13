@@ -394,11 +394,8 @@ namespace dsp56k
 
 	void Memory::memTranslateAddress(EMemArea& _area, const TWord& _addr) const
 	{
-		// m_mmuBuffer is RESET TO NULL by the constructor whenever the MMU path is
-		// unavailable, so this cannot dereference it unguarded. The bridged-memory
-		// aliasing that makes the translation unnecessary only exists when the MMU
-		// mapping is live; without it we must fall through and translate.
-		if(m_mmuBuffer && m_mmuBuffer->isValid())
+		// m_mmuBuffer is null if the host MMU could not be used, do not dereference it
+		if(hasMmuSupport())
 			return;
 
 //		if(_addr >= m_bridgedMemoryAddress)
