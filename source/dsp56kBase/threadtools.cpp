@@ -137,8 +137,19 @@ namespace dsp56k
 		if (result != 0)
 			LOG("Failed to set thread QOS class to " << qosClass << ": " << strerror(result));
 
-		// Realtime workers additionally get a time constraint policy. This applies conservative
-		// defaults, callers that know the audio block timing refine them via setCurrentThreadRealtimeParameters()
+		/* Realtime workers additionally get a time constraint policy. This is
+		 * LOAD-BEARING -- do not remove it in favour of the QOS class alone.
+		 *
+		 * Measured, iPad Pro M5, NodalRed2x as AUv3 in AUM at a 256-frame buffer:
+		 * the ESAI output ring sits pinned at its full 4190-frame (42.7ms) cushion
+		 * when idle and drains to 31-35 frames while the host UI scrolls or the app
+		 * is backgrounded, dspB falling 95.4 -> 88.9 MIPS: the workers lose CPU
+		 * exactly when something else wants it. Dropping the policy and keeping only
+		 * QOS_CLASS_USER_INTERACTIVE was tried and made it audibly WORSE right away,
+		 * with no backgrounding needed -- on Apple platforms this policy is what puts
+		 * a thread in the realtime band at all, and the QOS class is a hint beside it.
+		 *
+		 * What is actually wrong is the WINDOW, see setCurrentThreadRealtimeParameters(). */
 		if (_priority == ThreadPriority::Highest)
 			return setCurrentThreadRealtimeParameters(0, 0) || result == 0;
 
@@ -182,10 +193,20 @@ namespace dsp56k
 
 		if (_samplerate <= 0 || _blocksize <= 0)
 		{
-			// the audio block timing is not known (yet). Base the values on a typical setup but do
-			// not claim a fixed activation period as we do not know the real one
-			_samplerate = 44100;
-			_blocksize = 2048;
+			/* The audio block timing is not known. The old fallback here was
+			 * 44100/2048, i.e. a 46.4ms constraint window with a 23.2ms computation
+			 * budget, and since NOTHING in the tree ever calls this with real values
+			 * that was what every DSP worker ran with. The budget is renewed once per
+			 * window, so a 46ms window hands out protection in one slab and then not
+			 * again for tens of milliseconds -- during which the host UI wins and the
+			 * output ring drains (measured: 4190 frames -> 31 while scrolling).
+			 *
+			 * A short window renews far more often for the same duty cycle, which is
+			 * what a continuously-running audio producer wants. 128 frames at 48kHz
+			 * is 2.67ms, comfortably under any host block we see and well inside the
+			 * clamps below. */
+			_samplerate = 48000;
+			_blocksize = 128;
 			usePeriod = false;
 		}
 
