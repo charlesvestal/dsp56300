@@ -329,7 +329,16 @@ namespace dsp56k
 		 * so is safe. One discontinuity, then a stream that is current again. */
 		std::atomic<uint32_t>	m_discardInputFrames{0};
 		std::atomic<uint64_t>	m_droppedInputFrames{0};	// diagnostics only
-		uint32_t				m_maxInputBacklog = 8192;
+		/* OFF unless a device opts in, via setMaxInputBacklog().
+		 *
+		 * A deep input ring does not mean the same thing on every board. The
+		 * NodalRed2x pre-fills this ring on purpose -- writeEmptyAudioIn() plus
+		 * its own notify-correction accounting -- so depth there is by design,
+		 * not a backlog, and discarding from it starves the ESAI: the DSP spins
+		 * forever on btst #$6,x:$ffb3 (SAISR) waiting for a flag that never
+		 * comes, while its audio ISR keeps running. That is a HANG, not a
+		 * glitch, and enabling this globally caused it. */
+		uint32_t				m_maxInputBacklog = 0;
 
 		ReadRxCallback m_readRxCallback;
 		WriteTxCallback m_writeTxCallback;
