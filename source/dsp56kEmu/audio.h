@@ -1,4 +1,7 @@
 #pragma once
+#include <string>
+#include <cstdlib>
+#include <cstdio>
 #include <thread>
 #include <chrono>
 
@@ -157,6 +160,71 @@ namespace dsp56k
 		 * fires in normal operation and only ever converts "this plugin has wedged the
 		 * whole host" into "this plugin glitched". */
 		void setMaxOutputWaitUs(const uint32_t _us)		{ m_maxOutputWaitUs = _us; }
+
+		/* Diagnostic trail for the starvation path, OFF unless built with
+		 * -DTUS_AUDIO_HEALTH=1. Deliberately self-contained here rather than routed
+		 * through the plugin framework: synthLib::Device exposes no way to reach this
+		 * object, and giving jucePluginLib a dsp56kEmu dependency would break the
+		 * synths that do not link it.
+		 *
+		 * ringHeld is the decisive number. Silence with the audio path running on
+		 * schedule has two causes that need opposite fixes: starvations climbing with
+		 * an EMPTY ring means the producer has died, while no starvations and a
+		 * non-empty ring means the producer is alive and handing us zeros -- the
+		 * emulated firmware's own audio engine having stalled. */
+		/* Says whether the carry bound is engaging. This mechanism is the dsp56k
+		 * equivalent of jeThread's m_maxCarrySamples: for these synths the INPUT ring
+		 * is the work queue -- a fed input frame obliges the DSP to produce an output
+		 * frame -- so unconsumed input frames are the backlog, and skipping them is
+		 * "drop it and render NOW".
+		 *
+		 * It could never fire while the consumer blocked forever in the output wait,
+		 * because processBlock() feeds input and reads output in the SAME call: stuck
+		 * on output, we never returned to feed input, so the ring never grew past the
+		 * bound and the recovery never triggered. Worth knowing whether bounding that
+		 * wait has let it start working. */
+		void reportCarryDrop(const uint64_t _total, const uint32_t _excess, const size_t _depth, const size_t _limit) const
+		{
+#if TUS_AUDIO_HEALTH
+			if(const auto* home = std::getenv("HOME"))
+			{
+				const std::string path = std::string(home) + "/Documents/tus_audio_health.log";
+				if(auto* f = fopen(path.c_str(), "a"))
+				{
+					fprintf(f, "  CARRYDROP total=%llu dropped=%u depth=%zu limit=%zu\n",
+						static_cast<unsigned long long>(_total), _excess, _depth, _limit);
+					fclose(f);
+				}
+			}
+#else
+			(void)_total; (void)_excess; (void)_depth; (void)_limit;
+#endif
+		}
+
+		void reportStarvation(const uint64_t _count, const uint32_t _frame, const uint32_t _frames) const
+		{
+#if TUS_AUDIO_HEALTH
+			// at most one line a second, so a sustained stall cannot flood the file
+			const auto now = std::chrono::steady_clock::now();
+			if(now - m_lastStarvationReport < std::chrono::seconds(1))
+				return;
+			m_lastStarvationReport = now;
+
+			if(const auto* home = std::getenv("HOME"))
+			{
+				const std::string path = std::string(home) + "/Documents/tus_audio_health.log";
+				if(auto* f = fopen(path.c_str(), "a"))
+				{
+					fprintf(f, "  STARVED total=%llu atFrame=%u/%u ringHeld=%zu waitedUs=%u\n",
+						static_cast<unsigned long long>(_count), _frame, _frames,
+						m_audioOutputs.size(), m_maxOutputWaitUs);
+					fclose(f);
+				}
+			}
+#else
+			(void)_count; (void)_frame; (void)_frames;
+#endif
+		}
 		uint64_t getOutputStarvations() const			{ return m_outputStarvations.load(std::memory_order_relaxed); }
 
 		template<typename T, typename TFunc>
@@ -175,7 +243,8 @@ namespace dsp56k
 				{
 					const auto excess = static_cast<uint32_t>(depth - (_latency + (m_maxInputBacklog >> 1)));
 					m_discardInputFrames.store(excess, std::memory_order_release);
-					m_droppedInputFrames.fetch_add(excess, std::memory_order_relaxed);
+					const auto total = m_droppedInputFrames.fetch_add(excess, std::memory_order_relaxed) + excess;
+					reportCarryDrop(total, excess, depth, limit);
 				}
 			}
 
@@ -264,7 +333,8 @@ namespace dsp56k
 					{
 						if(std::chrono::steady_clock::now() >= deadline)
 						{
-							m_outputStarvations.fetch_add(1, std::memory_order_relaxed);
+							const auto n = m_outputStarvations.fetch_add(1, std::memory_order_relaxed) + 1;
+							reportStarvation(n, i, _frames);
 							return i;
 						}
 						std::this_thread::yield();
@@ -403,6 +473,7 @@ namespace dsp56k
 		uint32_t				m_maxInputBacklog = 0;
 		uint32_t				m_maxOutputWaitUs = 200'000;
 		std::atomic<uint64_t>	m_outputStarvations{0};
+		mutable std::chrono::steady_clock::time_point m_lastStarvationReport{};
 
 		ReadRxCallback m_readRxCallback;
 		WriteTxCallback m_writeTxCallback;
