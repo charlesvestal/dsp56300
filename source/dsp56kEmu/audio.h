@@ -172,6 +172,16 @@ namespace dsp56k
 		 * whole host" into "this plugin glitched". */
 		void setMaxOutputWaitUs(const uint32_t _us)		{ m_maxOutputWaitUs = _us; }
 
+		/* Offline (faster-than-real-time) rendering. Both mechanisms below trade audio
+		 * for meeting a deadline, and offline there is no deadline to meet: the host
+		 * is bouncing or freezing, not playing. Giving up on a frame would put a hole
+		 * in the file and discarding the input backlog would drop part of the render,
+		 * and since the engine is ALWAYS behind when the host renders as fast as it
+		 * can, both would fire on nearly every block. Make the caller wait instead --
+		 * it is not a realtime thread. */
+		void setNonRealtime(const bool _nonRealtime)	{ m_nonRealtime = _nonRealtime; }
+		bool isNonRealtime() const						{ return m_nonRealtime; }
+
 		/* Diagnostic trail for the starvation path, OFF unless built with
 		 * -DTUS_AUDIO_HEALTH=1. Deliberately self-contained here rather than routed
 		 * through the plugin framework: synthLib::Device exposes no way to reach this
@@ -245,7 +255,7 @@ namespace dsp56k
 			 * that by more than the bound, the DSP is not merely late, it is not
 			 * coming back on its own -- ask it to skip forward. Halve the bound as
 			 * the target so a recovery does not sit on the threshold and retrigger. */
-			if(m_maxInputBacklog)
+			if(m_maxInputBacklog && !m_nonRealtime)
 			{
 				const auto depth = m_audioInputs.size();
 				const auto limit = _latency + m_maxInputBacklog;
@@ -333,7 +343,7 @@ namespace dsp56k
 		{
 			for (uint32_t i = 0; i < _frames; ++i)
 			{
-				if(m_maxOutputWaitUs && m_audioOutputs.empty())
+				if(m_maxOutputWaitUs && !m_nonRealtime && m_audioOutputs.empty())
 				{
 					// empty()/size() are lock-free atomic loads, so the starvation check
 					// itself never blocks
@@ -484,6 +494,7 @@ namespace dsp56k
 		 * glitch, and enabling this globally caused it. */
 		uint32_t				m_maxInputBacklog = 0;
 		uint32_t				m_maxOutputWaitUs = 200'000;
+		bool					m_nonRealtime = false;
 		std::atomic<uint64_t>	m_outputStarvations{0};
 		mutable std::chrono::steady_clock::time_point m_lastStarvationReport{};
 
