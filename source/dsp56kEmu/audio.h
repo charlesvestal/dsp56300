@@ -154,9 +154,29 @@ namespace dsp56k
 			processAudioOutputInterleaved<T>(_outputs, _sampleFrames);
 		}
 		
+		void setMaxInputBacklog(const uint32_t _frames)	{ m_maxInputBacklog = _frames; }
+		uint64_t getDroppedInputFrames() const			{ return m_droppedInputFrames.load(std::memory_order_relaxed); }
+
 		template<typename T, typename TFunc>
 		void processAudioInput(const uint32_t _frames, const size_t _latency, const TFunc& _createRxFrame)
 		{
+			/* The legitimate depth of this ring is the configured latency. Beyond
+			 * that by more than the bound, the DSP is not merely late, it is not
+			 * coming back on its own -- ask it to skip forward. Halve the bound as
+			 * the target so a recovery does not sit on the threshold and retrigger. */
+			if(m_maxInputBacklog)
+			{
+				const auto depth = m_audioInputs.size();
+				const auto limit = _latency + m_maxInputBacklog;
+
+				if(depth > limit && !m_discardInputFrames.load(std::memory_order_relaxed))
+				{
+					const auto excess = static_cast<uint32_t>(depth - (_latency + (m_maxInputBacklog >> 1)));
+					m_discardInputFrames.store(excess, std::memory_order_release);
+					m_droppedInputFrames.fetch_add(excess, std::memory_order_relaxed);
+				}
+			}
+
 			for (uint32_t s = 0; s < _frames; ++s)
 			{
 				// INPUT
@@ -302,6 +322,35 @@ namespace dsp56k
 		size_t m_latency = 0;
 
 		std::atomic<bool> m_terminated{false};
+
+		/* Recovery from a transient overload.
+		 *
+		 * Host and DSP meet through two rings and BOTH sides block: the DSP waits
+		 * in readRX when the input ring is empty, the host waits here when it is
+		 * full. So when capacity drops below 1.0x the input ring fills with work
+		 * the DSP still owes, up to its 32768-frame capacity -- 0.68 s at 48 kHz.
+		 * That backlog is pure latency, and the only party that can retire it is
+		 * the DSP, at (capacity - 1.0)x. After a dip that means seconds of lag
+		 * that never fully clears, which is heard as the synth "never recovering"
+		 * even once the overload is gone.
+		 *
+		 * The host cannot drop those frames itself: it is the PRODUCER of that
+		 * ring, and popping from the producer side of an SPSC queue is a data
+		 * race. So it asks instead -- it publishes how many frames to skip, and
+		 * the DSP thread discards them on its own side of the ring, where doing
+		 * so is safe. One discontinuity, then a stream that is current again. */
+		std::atomic<uint32_t>	m_discardInputFrames{0};
+		std::atomic<uint64_t>	m_droppedInputFrames{0};	// diagnostics only
+		/* OFF unless a device opts in, via setMaxInputBacklog().
+		 *
+		 * A deep input ring does not mean the same thing on every board. The
+		 * NodalRed2x pre-fills this ring on purpose -- writeEmptyAudioIn() plus
+		 * its own notify-correction accounting -- so depth there is by design,
+		 * not a backlog, and discarding from it starves the ESAI: the DSP spins
+		 * forever on btst #$6,x:$ffb3 (SAISR) waiting for a flag that never
+		 * comes, while its audio ISR keeps running. That is a HANG, not a
+		 * glitch, and enabling this globally caused it. */
+		uint32_t				m_maxInputBacklog = 0;
 
 		ReadRxCallback m_readRxCallback;
 		WriteTxCallback m_writeTxCallback;

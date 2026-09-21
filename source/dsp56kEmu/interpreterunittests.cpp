@@ -75,8 +75,8 @@ namespace dsp56k
 		// Execute only the instruction, bypassing interrupt handling which
 		// is designed for a running DSP, not single-step unit tests.
 		dsp.pcCurrentInstruction = _pc;
-		const auto op = dsp.fetchPC();
-		dsp.execOp(op);
+		// execOp now resolves the opcode words from the cache and advances the PC itself
+		dsp.execOp(_pc);
 	}
 
 	void InterpreterUnitTests::testSubr()

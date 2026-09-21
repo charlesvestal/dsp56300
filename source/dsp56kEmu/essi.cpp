@@ -3,7 +3,11 @@
 #include "dsp.h"
 #include "interrupts.h"
 
-#if 1
+/* One line per peripheral register access, and the firmware polls TSMB in a
+ * tight loop: an idle Virus wrote 4.5 GB of this in 40 seconds of a RELEASE
+ * build, which is not a logging cost so much as a different program. Off
+ * unless asked for. */
+#ifdef DSP56K_LOG_ESSI
 #define LOGESSI(S)		LOG("ESSI" << m_index << ' ' << S)
 #else
 #define LOGESSI(S)

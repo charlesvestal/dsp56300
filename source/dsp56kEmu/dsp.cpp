@@ -219,14 +219,9 @@ namespace dsp56k
 		}
 		else
 		{
-			TWord op0, op1;
-			memReadOpcode(vba, op0, op1);
-
 			const auto oldSP = reg.sp.var;
 
-			m_opWordB = op1;
-
-			execOp(op0);
+			execOp(vba);
 
 			const auto jumped = reg.sp.var - oldSP;
 
@@ -234,8 +229,7 @@ namespace dsp56k
 			if(m_currentOpLen == 1 && !jumped)
 			{
 				pcCurrentInstruction = vba+1;
-				m_opWordB = 0;
-				execOp(op1);
+				execOp(vba+1);
 
 				// fast interrupt done
 				m_processingMode = DefaultPreventInterrupt;
@@ -317,14 +311,24 @@ namespace dsp56k
 		return std::string(ss.str());
 	}
 
-	void DSP::execOp(const TWord op)
+	void DSP::execOp(const TWord _pc)
 	{
+		const TWord currentOp = _pc;
+
+		if(ASMJIT_UNLIKELY(!m_opcodeCache[currentOp].op))
+			resolveCacheEntry(currentOp);
+
+		const auto& opCache = m_opcodeCache[currentOp];
+
+		const auto op = opCache.opWordA;
+		m_opWordB = opCache.opWordB;
+
 		getASM(op, m_opWordB);
 
 		m_currentOpLen = 1;
 
-		const TWord currentOp = pcCurrentInstruction;
-		const auto& opCache = m_opcodeCache[currentOp];
+		if(m_processingMode != FastInterrupt)
+			++reg.pc.var;
 
 		exec_jump(opCache.op, op);
 
@@ -340,12 +344,7 @@ namespace dsp56k
 		}
 	}
 
-	void DSP::exec_jump(const TInstructionFunc& _func, TWord _op)
-	{
-		(this->*_func)(_op);
-	}
-
-	bool DSP::exec_parallel(const TInstructionFunc& funcMove, const TInstructionFunc& funcAlu, const TWord _op)
+	bool DSP::exec_parallel(const TInstructionFuncFlat funcMove, const TInstructionFuncFlat funcAlu, const TWord _op)
 	{
 		// simulate latches registers for parallel instructions
 
@@ -596,23 +595,25 @@ namespace dsp56k
 
 		pcCurrentInstruction = reg.pc.var;
 		const auto repeatedOpPC = pcCurrentInstruction;
-		const auto op = fetchPC();
 
 		--reg.lc.var;
-		execOp(op);
+		execOp(repeatedOpPC);
 
 		// A two-word instruction moves PC past its extension word every time it runs, but it is fetched only
 		// once. sim56300 continues behind the first pass, however often it repeats.
 		const auto pcNext = reg.pc;
 
-		const auto& opCache = m_opcodeCache[pcCurrentInstruction];
+		// repeatedOpPC is pcCurrentInstruction captured before execOp(); the cache is
+		// keyed on the PC, so index it with the PC we actually executed.
+		const auto& opCache = m_opcodeCache[repeatedOpPC];
 
-		const auto& func = opCache.op;
+		const auto func = opCache.op;
+		const auto op = opCache.opWordA;
 
 		while( reg.lc.var > 0 )
 		{
 			--reg.lc.var;
-			(this->*func)(op);
+			func(this, op);
 			++m_instructions;
 			if constexpr(!g_useJIT)
 				m_cycles += getOpcodeCycles(repeatedOpPC);
@@ -1079,7 +1080,7 @@ namespace dsp56k
 
 	void DSP::notifyProgramMemWrite(TWord _offset)
 	{
-		m_opcodeCache[_offset].op = &DSP::op_ResolveCache;
+		m_opcodeCache[_offset].op = nullptr;
 		if constexpr(!g_useJIT)
 			m_opcodeCycleCache[_offset] = 0;
 
@@ -1357,20 +1358,108 @@ namespace dsp56k
 	void DSP::clearOpcodeCache()
 	{
 		m_opcodeCache.clear();
-		m_opcodeCache.resize(mem.sizeP(), {&DSP::op_ResolveCache});
+		m_opcodeCache.resize(mem.sizePCode(), {nullptr, 0, 0});
+		m_opcodeCacheParallel.clear();
+		m_opcodeCacheParallel.resize(mem.sizePCode(), {nullptr, nullptr});
 		if constexpr(!g_useJIT)
-			m_opcodeCycleCache.assign(mem.sizeP(), 0);
+			m_opcodeCycleCache.assign(mem.sizePCode(), 0);
 	}
 
 	void DSP::clearOpcodeCache(const TWord _address)
 	{
-		m_opcodeCache[_address].op = &DSP::op_ResolveCache;
+		m_opcodeCache[_address].op = nullptr;
 		if constexpr(!g_useJIT)
 			m_opcodeCycleCache[_address] = 0;
 		m_jit.notifyProgramMemWrite(_address);
 	}
 	
-	TInstructionFunc DSP::resolvePermutation(const Instruction _inst, const TWord _op)
+	void DSP::resolveCacheEntry(const TWord _pc)
+	{
+		auto& cacheEntry = m_opcodeCache[_pc];
+
+		TWord opA, opB;
+		memReadOpcode(_pc, opA, opB);
+
+		cacheEntry.opWordA = opA;
+		cacheEntry.opWordB = opB;
+		cacheEntry.op = flatten<&DSP::op_Nop>();
+
+		const auto op = opA;
+
+		if(!op)
+			return;
+
+		if(Opcodes::isNonParallelOpcode(op))
+		{
+			const auto* oi = m_opcodes.findNonParallelOpcodeInfo(op);
+
+			if(!oi)
+			{
+				m_opcodes.findNonParallelOpcodeInfo(op);		// retry here to help debugging
+				assert(0 && "illegal instruction");
+				return;
+			}
+
+			cacheEntry.op = resolvePermutation(oi->m_instruction, op);
+			return;
+		}
+
+		const auto* oiMove = m_opcodes.findParallelMoveOpcodeInfo(op);
+		if(!oiMove)
+		{
+			m_opcodes.findParallelMoveOpcodeInfo(op);		// retry here to help debugging
+			assert(0 && "illegal instruction");
+			return;
+		}
+
+		const OpcodeInfo* oiAlu = nullptr;
+
+		if(op & 0xff)
+		{
+			oiAlu = m_opcodes.findParallelAluOpcodeInfo(op);
+			if(!oiAlu)
+			{
+				m_opcodes.findParallelAluOpcodeInfo(op);	// retry here to help debugging
+				assert(0 && "invalid instruction");
+				return;
+			}
+		}
+
+		auto& parallelEntry = m_opcodeCacheParallel[_pc];
+
+		switch (oiMove->m_instruction)
+		{
+		case Move_Nop:
+			// Only ALU, no parallel move
+			if(oiAlu)
+				cacheEntry.op = resolvePermutation(oiAlu->m_instruction, op);
+			break;
+		case Ifcc:
+		case Ifcc_U:
+			// IFcc executes the ALU instruction if the condition is met, therefore no ALU exec by us
+			if(oiAlu)
+			{
+				cacheEntry.op = resolvePermutation(oiMove->m_instruction, op);
+				parallelEntry.opAlu = resolvePermutation(oiAlu->m_instruction, op);
+			}
+			break;
+		default:
+			if(!oiAlu)
+			{
+				// if there is no ALU instruction, do only the move
+				cacheEntry.op = resolvePermutation(oiMove->m_instruction, op);
+			}
+			else
+			{
+				// call special function that simulates latch registers for alu op + parallel move
+				cacheEntry.op = flatten<&DSP::op_Parallel>();
+				parallelEntry.opMove = resolvePermutation(oiMove->m_instruction, op);
+				parallelEntry.opAlu = resolvePermutation(oiAlu->m_instruction, op);
+			}
+		}
+	}
+
+	TInstructionFuncFlat DSP::resolvePermutation(const Instruction _inst, const TWord _op)
 	{
 		const auto funcIndex = g_jumptable.resolve(_inst, _op);
 		return g_jumptable.jumptable()[funcIndex];

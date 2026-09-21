@@ -474,7 +474,7 @@ namespace dsp56k
 		return a;
 	}
 
-	inline TWord DSP::decode_MMMRRR_read( TWord _mmm, TWord _rrr )
+	ASMJIT_FORCE_INLINE TWord DSP::decode_MMMRRR_read( TWord _mmm, TWord _rrr )
 	{
 		switch(_mmm << 3 | _rrr)
 		{
@@ -517,7 +517,7 @@ namespace dsp56k
 		return a;
 	}
 
-	inline TWord DSP::decode_XMove_MMRRR( TWord _mm, TWord _rrr )
+	ASMJIT_FORCE_INLINE TWord DSP::decode_XMove_MMRRR( TWord _mm, TWord _rrr )
 	{
 		const TReg24	_n = reg.n[_rrr];
 		TReg24&			_r = reg.r[_rrr];

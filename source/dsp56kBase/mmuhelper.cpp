@@ -1,4 +1,5 @@
 #include "mmuhelper.h"
+#include <cstdlib>
 
 #ifndef __ANDROID__
 
@@ -236,6 +237,8 @@ namespace dsp56k
 		std::stringstream name;
 		name << "dsp56300_" << reinterpret_cast<uint64_t>(this) << '_' << g_uid++;
 		const std::string na(name.str());
+
+		if(const char* e = ::getenv("DSP56K_NO_MMU"); e && *e == '1') { LOG("MmuHelper: forced off"); return false; }
 
 		int fd = shm_open(na.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
 		if (fd == InvalidHandle)

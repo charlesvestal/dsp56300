@@ -243,12 +243,20 @@ namespace dsp56k
 		&DSP::op_Tst,							// Tst 
 		&DSP::op_Vsl,							// Vsl 
 		&DSP::op_Wait,							// Wait 
-		&DSP::op_ResolveCache,					// ResolveCache
+		&DSP::op_Nop,							// ResolveCache (unused, kept for index alignment)
 		&DSP::op_Parallel,						// Parallel
 	};
 
 	constexpr size_t g_opcodeFuncsSize = sizeof(g_opcodeFuncs) / sizeof(g_opcodeFuncs[0]);
 	static_assert(g_opcodeFuncsSize <= 256, "jump table too large");
+
+	// thunked copy of the table above, dispatch uses plain function pointers
+	template<size_t... I> constexpr std::array<TInstructionFuncFlat, sizeof...(I)> makeFlatFuncs(std::index_sequence<I...>) noexcept
+	{
+		return {{ flatten<g_opcodeFuncs[I]>()... }};
+	}
+
+	constexpr auto g_opcodeFuncsFlat = makeFlatFuncs(std::make_index_sequence<g_opcodeFuncsSize>());
 
 	using TField = std::pair<Field,TWord>;	// Field + Field Value
 
@@ -351,17 +359,17 @@ namespace dsp56k
 
 	constexpr size_t g_permutationTypeCount = sizeof(g_permutationTypes) / sizeof(g_permutationTypes[0]);
 
-	struct FunctorAbs		{ template<TWord A>				constexpr TInstructionFunc get() const noexcept	{ return &DSP::opCE_Abs<A>;			} };
-	struct FunctorAsl		{ template<TWord A>				constexpr TInstructionFunc get() const noexcept	{ return &DSP::opCE_Asl_D<A>;		} };
-	struct FunctorAndSD		{ template<TWord A, TWord B>	constexpr TInstructionFunc get() const noexcept { return &DSP::opCE_And_SD<A,B>;	} };
+	struct FunctorAbs		{ template<TWord A>				constexpr TInstructionFuncFlat get() const noexcept	{ return flatten<&DSP::opCE_Abs<A>>();			} };
+	struct FunctorAsl		{ template<TWord A>				constexpr TInstructionFuncFlat get() const noexcept	{ return flatten<&DSP::opCE_Asl_D<A>>();		} };
+	struct FunctorAndSD		{ template<TWord A, TWord B>	constexpr TInstructionFuncFlat get() const noexcept { return flatten<&DSP::opCE_And_SD<A,B>>();	} };
 
-	struct FunctorMovexy	{ template<TWord W, TWord w, TWord ee, TWord ff>	constexpr TInstructionFunc get() const noexcept { return &DSP::opCE_Movexy<W,w,ee,ff>;	} };
+	struct FunctorMovexy	{ template<TWord W, TWord w, TWord ee, TWord ff>	constexpr TInstructionFuncFlat get() const noexcept { return flatten<&DSP::opCE_Movexy<W,w,ee,ff>>();	} };
 
-	struct FunctorMovex_ea	{ template<TWord W, TWord MMM>	constexpr TInstructionFunc get() const noexcept { return &DSP::opCE_Movex_ea<W, MMM>;	} };
-	struct FunctorMovey_ea	{ template<TWord W, TWord MMM>	constexpr TInstructionFunc get() const noexcept { return &DSP::opCE_Movey_ea<W, MMM>;	} };
+	struct FunctorMovex_ea	{ template<TWord W, TWord MMM>	constexpr TInstructionFuncFlat get() const noexcept { return flatten<&DSP::opCE_Movex_ea<W, MMM>>();	} };
+	struct FunctorMovey_ea	{ template<TWord W, TWord MMM>	constexpr TInstructionFuncFlat get() const noexcept { return flatten<&DSP::opCE_Movey_ea<W, MMM>>();	} };
 
-	struct FunctorMovex_aa	{ template<TWord W>	constexpr TInstructionFunc get() const noexcept { return &DSP::opCE_Movex_aa<W>;	} };
-	struct FunctorMovey_aa	{ template<TWord W>	constexpr TInstructionFunc get() const noexcept { return &DSP::opCE_Movey_aa<W>;	} };
+	struct FunctorMovex_aa	{ template<TWord W>	constexpr TInstructionFuncFlat get() const noexcept { return flatten<&DSP::opCE_Movex_aa<W>>();	} };
+	struct FunctorMovey_aa	{ template<TWord W>	constexpr TInstructionFuncFlat get() const noexcept { return flatten<&DSP::opCE_Movey_aa<W>>();	} };
 
 	constexpr TWord permutationCount(const Instruction _inst, const Field _field) noexcept
 	{
@@ -455,7 +463,7 @@ namespace dsp56k
 	struct Permutation
 	{
 		Instruction inst;
-		TInstructionFunc func;
+		TInstructionFuncFlat func;
 		std::array<TField, fieldCount<I>()> fields;
 	};
 
@@ -503,7 +511,7 @@ namespace dsp56k
 
 	template<Instruction I, TPack Pack> constexpr TWord permutationValue()			{ return permutationValue<I, unpackField<Pack>(), unpackIndex<Pack>()>(); }
 
-	template<typename Functor, Instruction I, TPack ...Pack> constexpr TInstructionFunc getPtr()
+	template<typename Functor, Instruction I, TPack ...Pack> constexpr TInstructionFuncFlat getPtr()
 	{
 		return Functor().template get< permutationValue<I, Pack>()...>();
 	}
@@ -574,7 +582,7 @@ namespace dsp56k
 			m_jumpTable.reserve(g_opcodeFuncsSize);
 
 			for(size_t i=0; i<g_opcodeFuncsSize; ++i)
-				m_jumpTable.push_back(g_opcodeFuncs[i]);
+				m_jumpTable.push_back(g_opcodeFuncsFlat[i]);
 
 			addPermutations(getFuncs<FunctorAbs, Abs, Field_d>());
 			addPermutations(getFuncs<FunctorAndSD, And_SD, Field_d, Field_JJ>());
@@ -585,7 +593,7 @@ namespace dsp56k
 			addPermutations(getFuncs<FunctorMovey_aa, Movey_aa, Field_W>());
 		}
 
-		const std::vector<TInstructionFunc>& jumptable() const { return m_jumpTable; }
+		const std::vector<TInstructionFuncFlat>& jumptable() const { return m_jumpTable; }
 		TWord resolve(const Instruction _inst, const TWord _op) const
 		{
 			const auto& perms = m_permutationInfo[_inst];
@@ -656,7 +664,7 @@ namespace dsp56k
 			}
 		}
 
-		std::vector<TInstructionFunc> m_jumpTable;
+		std::vector<TInstructionFuncFlat> m_jumpTable;
 		std::array<PermutationList, InstructionCount> m_permutationInfo;
 	};
 }

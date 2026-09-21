@@ -154,7 +154,13 @@ namespace dsp56k
 			LOG("No profiler detected");
 		}
 
-		m_trampoline.generateCode();
+		// An interpreter-only build never reaches execJit(), so the trampoline is
+		// dead code -- but generating it still calls JitRuntime::add(), which needs
+		// an executable mapping. iOS refuses that to any process without the JIT
+		// entitlement, and add()'s error is not checked here, so the failure would
+		// be silent at best. Do not emit what cannot be run.
+		if constexpr(g_jitSupported)
+			m_trampoline.generateCode();
 	}
 
 	Jit::~Jit()

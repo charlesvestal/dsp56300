@@ -55,6 +55,7 @@ namespace dsp56k
 		
 		// number of words of 24-bit data for 3 banks (XYP)
 		std::array<TWord, MemArea_COUNT>					m_size;
+		TWord												m_pCodeSize = 0;
 		std::vector<TWord>									m_buffer;
 		std::array<TWord*, MemArea_COUNT>					m_mem;
 
@@ -116,6 +117,11 @@ namespace dsp56k
 		TWord				size				(EMemArea _area) const	{ return m_size[_area]; }
 		TWord				sizeXY				() const				{ return size(MemArea_X); }
 		TWord				sizeP				() const				{ return size(MemArea_P); }
+
+		// The DSP's P CODE span, which is what an opcode cache needs to cover. This is
+		// NOT sizeP(): with bridged memory on the non-MMU path, P is widened to hold the
+		// bridged XY range, and sizing a per-PC cache from that costs 200 MB on a microQ.
+		TWord				sizePCode			() const				{ return m_pCodeSize; }
 
 		void				setExternalMemory	(const TWord _address, bool _isExternalMemoryBridged)
 		{
