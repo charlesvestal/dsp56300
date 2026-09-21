@@ -1084,6 +1084,21 @@ namespace dsp56k
 		if constexpr(!g_useJIT)
 			m_opcodeCycleCache[_offset] = 0;
 
+		/* Our cache entry holds the instruction's EXTENSION word as well as its
+		 * opcode word, so a write invalidates two entries: the one at this address
+		 * and the one before it, whose second word this may be. Upstream re-reads the
+		 * extension word on every execution and so only ever needs the first.
+		 *
+		 * Without this, code that rewrites a word which is both an instruction of its
+		 * own and another instruction's operand keeps running the old operand --
+		 * UnitTests::blockOnExtensionWord is exactly that case. */
+		if(_offset)
+		{
+			m_opcodeCache[_offset - 1].op = nullptr;
+			if constexpr(!g_useJIT)
+				m_opcodeCycleCache[_offset - 1] = 0;
+		}
+
 #if DSP56300_DEBUGGER
 		if(m_debugger)
 			m_debugger->onProgramMemWrite(_offset);
@@ -1370,6 +1385,20 @@ namespace dsp56k
 		m_opcodeCache[_address].op = nullptr;
 		if constexpr(!g_useJIT)
 			m_opcodeCycleCache[_address] = 0;
+		/* Our cache entry holds the instruction's EXTENSION word as well as its
+		 * opcode word, so a write invalidates two entries: the one at this address
+		 * and the one before it, whose second word this may be. Upstream re-reads the
+		 * extension word on every execution and so only ever needs the first.
+		 *
+		 * Without this, code that rewrites a word which is both an instruction of its
+		 * own and another instruction's operand keeps running the old operand --
+		 * UnitTests::blockOnExtensionWord is exactly that case. */
+		if(_address)
+		{
+			m_opcodeCache[_address - 1].op = nullptr;
+			if constexpr(!g_useJIT)
+				m_opcodeCycleCache[_address - 1] = 0;
+		}
 		m_jit.notifyProgramMemWrite(_address);
 	}
 	
