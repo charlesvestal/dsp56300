@@ -1,4 +1,9 @@
 #pragma once
+#include <string>
+#include <cstdlib>
+#include <cstdio>
+#include <thread>
+#include <chrono>
 
 #include <array>
 #include <atomic>
@@ -157,6 +162,82 @@ namespace dsp56k
 		void setMaxInputBacklog(const uint32_t _frames)	{ m_maxInputBacklog = _frames; }
 		uint64_t getDroppedInputFrames() const			{ return m_droppedInputFrames.load(std::memory_order_relaxed); }
 
+		/* Longest the CONSUMER may wait for the DSP before giving up on a frame and
+		 * treating the rest of the block as silence. 0 disables the bound and restores
+		 * the old wait-forever behaviour.
+		 *
+		 * The default is deliberately generous: 200ms is far beyond any legitimate wait
+		 * -- a host at any sane buffer size has long since underrun -- so this never
+		 * fires in normal operation and only ever converts "this plugin has wedged the
+		 * whole host" into "this plugin glitched". */
+		void setMaxOutputWaitUs(const uint32_t _us)		{ m_maxOutputWaitUs = _us; }
+
+		/* Diagnostic trail for the starvation path, OFF unless built with
+		 * -DTUS_AUDIO_HEALTH=1. Deliberately self-contained here rather than routed
+		 * through the plugin framework: synthLib::Device exposes no way to reach this
+		 * object, and giving jucePluginLib a dsp56kEmu dependency would break the
+		 * synths that do not link it.
+		 *
+		 * ringHeld is the decisive number. Silence with the audio path running on
+		 * schedule has two causes that need opposite fixes: starvations climbing with
+		 * an EMPTY ring means the producer has died, while no starvations and a
+		 * non-empty ring means the producer is alive and handing us zeros -- the
+		 * emulated firmware's own audio engine having stalled. */
+		/* Says whether the carry bound is engaging. This mechanism is the dsp56k
+		 * equivalent of jeThread's m_maxCarrySamples: for these synths the INPUT ring
+		 * is the work queue -- a fed input frame obliges the DSP to produce an output
+		 * frame -- so unconsumed input frames are the backlog, and skipping them is
+		 * "drop it and render NOW".
+		 *
+		 * It could never fire while the consumer blocked forever in the output wait,
+		 * because processBlock() feeds input and reads output in the SAME call: stuck
+		 * on output, we never returned to feed input, so the ring never grew past the
+		 * bound and the recovery never triggered. Worth knowing whether bounding that
+		 * wait has let it start working. */
+		void reportCarryDrop(const uint64_t _total, const uint32_t _excess, const size_t _depth, const size_t _limit) const
+		{
+#if TUS_AUDIO_HEALTH
+			if(const auto* home = std::getenv("HOME"))
+			{
+				const std::string path = std::string(home) + "/Documents/tus_audio_health.log";
+				if(auto* f = fopen(path.c_str(), "a"))
+				{
+					fprintf(f, "  CARRYDROP total=%llu dropped=%u depth=%zu limit=%zu\n",
+						static_cast<unsigned long long>(_total), _excess, _depth, _limit);
+					fclose(f);
+				}
+			}
+#else
+			(void)_total; (void)_excess; (void)_depth; (void)_limit;
+#endif
+		}
+
+		void reportStarvation(const uint64_t _count, const uint32_t _frame, const uint32_t _frames) const
+		{
+#if TUS_AUDIO_HEALTH
+			// at most one line a second, so a sustained stall cannot flood the file
+			const auto now = std::chrono::steady_clock::now();
+			if(now - m_lastStarvationReport < std::chrono::seconds(1))
+				return;
+			m_lastStarvationReport = now;
+
+			if(const auto* home = std::getenv("HOME"))
+			{
+				const std::string path = std::string(home) + "/Documents/tus_audio_health.log";
+				if(auto* f = fopen(path.c_str(), "a"))
+				{
+					fprintf(f, "  STARVED total=%llu atFrame=%u/%u ringHeld=%zu waitedUs=%u\n",
+						static_cast<unsigned long long>(_count), _frame, _frames,
+						m_audioOutputs.size(), m_maxOutputWaitUs);
+					fclose(f);
+				}
+			}
+#else
+			(void)_count; (void)_frame; (void)_frames;
+#endif
+		}
+		uint64_t getOutputStarvations() const			{ return m_outputStarvations.load(std::memory_order_relaxed); }
+
 		template<typename T, typename TFunc>
 		void processAudioInput(const uint32_t _frames, const size_t _latency, const TFunc& _createRxFrame)
 		{
@@ -173,7 +254,8 @@ namespace dsp56k
 				{
 					const auto excess = static_cast<uint32_t>(depth - (_latency + (m_maxInputBacklog >> 1)));
 					m_discardInputFrames.store(excess, std::memory_order_release);
-					m_droppedInputFrames.fetch_add(excess, std::memory_order_relaxed);
+					const auto total = m_droppedInputFrames.fetch_add(excess, std::memory_order_relaxed) + excess;
+					reportCarryDrop(total, excess, depth, limit);
 				}
 			}
 
@@ -232,23 +314,57 @@ namespace dsp56k
 			});
 		}
 
+		/* Returns the number of frames actually delivered, which may be fewer than
+		 * asked for. See setMaxOutputWaitUs(): the caller MUST treat the shortfall as
+		 * silence, because this is the consumer side and the caller is, in a plugin,
+		 * the host's realtime render thread.
+		 *
+		 * pop_front() on an audio-mode ring blocks on a semaphore with no timeout
+		 * (waitNotEmpty() is a no-op there), so a DSP that cannot keep up used to hold
+		 * that thread for as long as it liked. Measured with Osirus as an AUv3 in AUM
+		 * on an iPhone 15 Pro, logging wall time per 2s of audio produced: 2000ms while
+		 * healthy, then 3399ms, 6086ms, 5767ms once the process had been backgrounded
+		 * and throttled -- i.e. sitting in the host's render callback for three times
+		 * the block duration, indefinitely. The host cannot service anything else in
+		 * that state, so EVERY other plugin went silent too and the only recovery was
+		 * killing the host. A struggling synth must degrade alone. */
 		template<typename T, typename TFunc>
-		void processAudioOutput(const uint32_t _frames, const TFunc& _readOutputCbk)
+		uint32_t processAudioOutput(const uint32_t _frames, const TFunc& _readOutputCbk)
 		{
 			for (uint32_t i = 0; i < _frames; ++i)
 			{
+				if(m_maxOutputWaitUs && m_audioOutputs.empty())
+				{
+					// empty()/size() are lock-free atomic loads, so the starvation check
+					// itself never blocks
+					const auto deadline = std::chrono::steady_clock::now()
+						+ std::chrono::microseconds(m_maxOutputWaitUs);
+
+					while(m_audioOutputs.empty())
+					{
+						if(std::chrono::steady_clock::now() >= deadline)
+						{
+							const auto n = m_outputStarvations.fetch_add(1, std::memory_order_relaxed) + 1;
+							reportStarvation(n, i, _frames);
+							return i;
+						}
+						std::this_thread::yield();
+					}
+				}
+
 				m_audioOutputs.waitNotEmpty();
 				m_audioOutputs.pop_front([&](TxFrame& _frame)
 				{
 					_readOutputCbk(i, _frame);
 				});
 			}
+			return _frames;
 		}
 
 		template<typename T>
 		void processAudioOutputInterleaved(T** _outputs, const uint32_t _sampleFrames)
 		{
-			processAudioOutput<T>(_sampleFrames, [&](size_t _frame, TxFrame& _tx)
+			const auto delivered = processAudioOutput<T>(_sampleFrames, [&](size_t _frame, TxFrame& _tx)
 			{
 				if(_tx.empty())
 					return;
@@ -270,13 +386,21 @@ namespace dsp56k
 				_outputs[ 9][_frame] = dsp2sample<T>(_tx[1][4]);
 				_outputs[11][_frame] = dsp2sample<T>(_tx[1][5]);
 			});
+
+			// the DSP did not deliver in time: the rest of the block is silence. Written
+			// explicitly because the caller's buffer may still hold input or stale audio
+			for(uint32_t f = delivered; f < _sampleFrames; ++f)
+			{
+				for(uint32_t ch = 0; ch < 12; ++ch)
+					_outputs[ch][f] = T(0);
+			}
 		}
 
 		template<typename T>
 		void processAudioOutput(T* _outputs, const uint32_t _sampleFrames)
 		{
 			size_t writePos = 0;
-			processAudioOutput<T>(_sampleFrames, [&](size_t _frame, TxFrame& _tx)
+			const auto delivered = processAudioOutput<T>(_sampleFrames, [&](size_t _frame, TxFrame& _tx)
 			{
 				for(size_t s=0; s<_tx.size(); ++s)
 				{
@@ -285,6 +409,14 @@ namespace dsp56k
 						_outputs[writePos++] = dsp2sample<T>(v);
 				}
 			});
+
+			// shortfall is silence; writePos is where the delivered frames stopped
+			if(delivered < _sampleFrames)
+			{
+				const auto perFrame = delivered ? writePos / delivered : 0;
+				for(size_t i = writePos; i < perFrame * _sampleFrames; ++i)
+					_outputs[i] = T(0);
+			}
 		}
 
 		const auto& getAudioInputs() const { return m_audioInputs; }
@@ -351,6 +483,9 @@ namespace dsp56k
 		 * comes, while its audio ISR keeps running. That is a HANG, not a
 		 * glitch, and enabling this globally caused it. */
 		uint32_t				m_maxInputBacklog = 0;
+		uint32_t				m_maxOutputWaitUs = 200'000;
+		std::atomic<uint64_t>	m_outputStarvations{0};
+		mutable std::chrono::steady_clock::time_point m_lastStarvationReport{};
 
 		ReadRxCallback m_readRxCallback;
 		WriteTxCallback m_writeTxCallback;
